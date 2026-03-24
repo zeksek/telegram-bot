@@ -1,87 +1,174 @@
-import yfinance as yf
-import pandas as pd
-import requests
+import os
 import time
-from threading import Thread
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import logging
+import requests
+import numpy as np
+import pandas as pd
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# --- ⚙️ AYARLAR ---
-TOKEN = "8349458683:AAEi-AFSYxn0Skds7r4VQIaogVl3Fugftyw"
-ID_GUNLUK = "1484256652"          
-ID_KANAL = "-1003792245773"       
+from binance.um_futures import UMFutures
+import yfinance as yf
 
-def telegram_gonder(chat_id, mesaj):
+# ══════════════════════════════════════════════════════════════
+#  ⚙️  YAPILANDIRMA (Senin Stratejin)
+# ══════════════════════════════════════════════════════════════
+
+API_KEY    = os.environ.get("BINANCE_API_KEY",    "BURAYA_BINANCE_API_KEY")
+API_SECRET = os.environ.get("BINANCE_API_SECRET", "BURAYA_BINANCE_SECRET_KEY")
+
+TIMEFRAME  = "1d"  # Apple verilerinde olduğu gibi GÜNLÜK en sağlıklısıdır
+LEVERAGE   = 20
+TRADE_USDT = 1000
+
+# Senin meşhur 100$ (kasanın %10'u) stopun. 20x kaldıraçta bu %0.5 hareket demektir.
+TRAILING_STOP_PCT = 0.5 
+
+# RSI Pusu ve Tetik Seviyeleri
+RSI_PERIOD      = 14
+RSI_PUSU_ALT    = 28  # Bu seviyenin altına inmeli (Yay gerilmeli)
+RSI_PUSU_UST    = 72  # Bu seviyenin üstüne çıkmalı
+RSI_TETIK_LONG  = 31  # 28'den dönüp buraya değerse LONG
+RSI_TETIK_SHORT = 69  # 72'den dönüp buraya değerse SHORT
+
+NW_BANDWIDTH = 8.0
+NW_MULT      = 3.0
+NW_LOOKBACK  = 500
+KLINES_LIMIT = 1000
+
+LOOP_INTERVAL_SEC = 3600  # Saatte bir tara (Yeni mum kapanışını yakalamak için)
+MAX_WORKERS       = 10
+
+TELEGRAM_TOKEN     = "8349458683:AAEi-AFSYxn0Skds7r4VQIaogVl3Fugftyw"
+TELEGRAM_ID_GUNLUK = "1484256652"
+TELEGRAM_ID_KANAL  = "-1003792245773"
+
+# ══════════════════════════════════════════════════════════════
+#  📋 LOGGING & TELEGRAM
+# ══════════════════════════════════════════════════════════════
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("RSI_BOT")
+
+def tg_notify(text: str):
+    targets = [TELEGRAM_ID_GUNLUK, TELEGRAM_ID_KANAL]
+    for chat_id in targets:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        try:
+            requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=10)
+        except Exception as e:
+            logger.error(f"Telegram hatası: {e}")
+
+# ══════════════════════════════════════════════════════════════
+#  📐 İNDİKATÖRLER & STRATEJİ
+# ══════════════════════════════════════════════════════════════
+
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    # 1. RSI
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+    avg_gain = gain.ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    df["rsi"] = 100 - (100 / (1 + rs))
+
+    # 2. Heikin Ashi
+    df["ha_close"] = (df["open"] + df["high"] + df["low"] + df["close"]) / 4
+    ha_open = [(df["open"].iloc[0] + df["close"].iloc[0]) / 2]
+    for i in range(1, len(df)):
+        ha_open.append((ha_open[i-1] + df["ha_close"].iloc[i-1]) / 2)
+    df["ha_open"] = ha_open
+    df["ha_color"] = np.where(df["ha_close"] > df["ha_open"], "green", "red")
+
+    # 3. Nadaraya-Watson (Basitleştirilmiş Envelope)
+    close = df["close"].values
+    n = len(close)
+    nw_mid = np.full(n, np.nan)
+    for i in range(NW_LOOKBACK, n):
+        segment = close[i-NW_LOOKBACK+1 : i+1]
+        nw_mid[i] = np.mean(segment) # Hızlı hesaplama için MA bazlı
+    
+    std = df["close"].rolling(window=NW_LOOKBACK).std()
+    df["nw_upper"] = nw_mid + (NW_MULT * std)
+    df["nw_lower"] = nw_mid - (NW_MULT * std)
+    return df
+
+def generate_signal(df: pd.DataFrame) -> str:
+    if len(df) < 15: return "NONE"
+    
+    curr = df.iloc[-2] # Kapanan mum
+    prev = df.iloc[-3] # Bir önceki mum
+    past = df.iloc[-15:-2] # Son 2 haftalık pusu kontrolü
+
+    # PUSU KONTROLÜ: Son 15 mumda o uç değer görüldü mü?
+    was_oversold = (past["rsi"] < RSI_PUSU_ALT).any()
+    was_overbought = (past["rsi"] > RSI_PUSU_UST).any()
+
+    # TETİK KONTROLÜ: RSI senin istediğin 31/69 bandına döndü mü?
+    long_trigger = was_oversold and curr["rsi"] >= RSI_TETIK_LONG and prev["rsi"] < RSI_TETIK_LONG
+    short_trigger = was_overbought and curr["rsi"] <= RSI_TETIK_SHORT and prev["rsi"] > RSI_TETIK_SHORT
+
+    if long_trigger and curr["ha_color"] == "green":
+        return "LONG"
+    if short_trigger and curr["ha_color"] == "red":
+        return "SHORT"
+    return "NONE"
+
+# ══════════════════════════════════════════════════════════════
+#  🌐 TARAMA MANTIĞI
+# ══════════════════════════════════════════════════════════════
+
+binance_client = UMFutures(key=API_KEY, secret=API_SECRET)
+
+def scan_asset(market, symbol):
     try:
-        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-        payload = {"chat_id": chat_id, "text": mesaj, "parse_mode": "Markdown"}
-        requests.post(url, json=payload, timeout=10)
-    except: pass
+        if market == "CRYPTO":
+            raw = binance_client.klines(symbol=symbol, interval=TIMEFRAME, limit=KLINES_LIMIT)
+            df = pd.DataFrame(raw, columns=["t","open","high","low","close","v","ct","qv","tr","tb","tq","i"])
+        else:
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(period="1y", interval=TIMEFRAME)
+            df.columns = [c.lower() for c in df.columns]
 
-# --- 📋 LİSTELER ---
-kripto_liste = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "AVAXUSDT", "XRPUSDT", "ADAUSDT", "DOTUSDT", "LINKUSDT", "DOGEUSDT", "KASUSDT"]
-hisse_liste = ["THYAO.IS", "SISE.IS", "EREGL.IS", "KCHOL.IS", "ASELS.IS", "TUPRS.IS", "GARAN.IS", "NVDA", "TSLA", "AAPL", "MSFT", "GC=F"]
+        df = df[["open","high","low","close"]].astype(float)
+        df = compute_indicators(df)
+        sig = generate_signal(df)
 
-def heikin_ashi_hesapla(df):
-    ha_df = pd.DataFrame(index=df.index)
-    ha_df['HA_Close'] = (df['Open'] + df['High'] + df['Low'] + df['Close']) / 4
-    return ha_df['HA_Close']
+        if sig != "NONE":
+            price = df["close"].iloc[-2]
+            rsi_val = df["rsi"].iloc[-2]
+            stop = price * (1 - TRAILING_STOP_PCT/100) if sig == "LONG" else price * (1 + TRAILING_STOP_PCT/100)
+            
+            msg = (f"🚀 <b>YENİ SİNYAL: {sig}</b>\n"
+                   f"━━━━━━━━━━━━━━\n"
+                   f"🔖 Sembol: #{symbol}\n"
+                   f"💵 Fiyat: {price:.2f}\n"
+                   f"📊 RSI: {rsi_val:.2f}\n"
+                   f"🛑 100$ Stop: {stop:.2f}\n"
+                   f"⚡ Kaldıraç: {LEVERAGE}x")
+            tg_notify(msg)
+    except:
+        pass
 
-def veri_getir(sembol, interval, period):
-    try:
-        if "USDT" in sembol: # Kripto ise Binance'ten çek
-            limit = 300
-            # Binance interval dönüşümü
-            b_int = interval.replace("m", "m").replace("h", "h").replace("d", "d")
-            url = f"https://api.binance.com/api/v3/klines?symbol={sembol}&interval={b_int}&limit={limit}"
-            data = requests.get(url).json()
-            df = pd.DataFrame(data, columns=['Time', 'Open', 'High', 'Low', 'Close', 'Volume', '', '', '', '', '', ''])
-            df[['Open', 'High', 'Low', 'Close', 'Volume']] = df[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
-            return df
-        else: # Hisse ise Yahoo'dan çek
-            t = yf.Ticker(sembol)
-            return t.history(period=period, interval=interval)
-    except: return None
+def run():
+    # Başlangıç Mesajı
+    start_txt = (f"🤖 <b>KOD BAŞLADI</b>\n"
+                 f"━━━━━━━━━━━━━━\n"
+                 f"🎯 Strateji: RSI {RSI_PUSU_ALT}-{RSI_PUSU_UST} Pusu\n"
+                 f"📈 Tetik: {RSI_TETIK_LONG}/{RSI_TETIK_SHORT}\n"
+                 f"🛡️ Stop: %{TRAILING_STOP_PCT} (20x'te 100$)\n"
+                 f"📡 Tarama: 200 Varlık (Hisse + Kripto)")
+    tg_notify(start_txt)
+    logger.info("Bot Telegram bildirimi ile başlatıldı.")
 
-def tarama_motoru(periyot_adi, interval, period, sma_ayar, bekleme, hedef_id):
     while True:
-        tam_liste = kripto_liste + hisse_liste
-        for sembol in tam_liste:
-            try:
-                df = veri_getir(sembol, interval, period)
-                if df is None or df.empty or len(df) < max(sma_ayar): continue
-                
-                ha_close = heikin_ashi_hesapla(df)
-                sma_kisa = ha_close.rolling(window=sma_ayar[0]).mean()
-                sma_uzun = ha_close.rolling(window=sma_ayar[1]).mean()
-                fiyat_normal = float(df['Close'].iloc[-1])
-
-                if sma_kisa.iloc[-2] <= sma_uzun.iloc[-2] and sma_kisa.iloc[-1] > sma_uzun.iloc[-1]:
-                    avg_vol = df['Volume'].tail(15).mean()
-                    cvd_onay = "✅ GÜÇLÜ CVD" if df['Volume'].iloc[-1] > (avg_vol * 1.1) else "⚠️ ZAYIF HACİM"
-                    
-                    msg = (f"🚀 {sembol} {periyot_adi} SİNYAL\n"
-                           f"💰 Fiyat: {fiyat_normal:.2f}\n"
-                           f"📊 Durum: {cvd_onay}\n"
-                           f"🕯️ Binance & HA Filtresi Aktif")
-                    telegram_gonder(hedef_id, msg)
-                
-                time.sleep(0.5)
-            except: continue
-        time.sleep(bekleme)
-
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Hybrid Engine Online")
+        # Burada senin CRYPTO_SYMBOLS ve STOCK_SYMBOLS listelerin olacak
+        assets = [("STOCK", "AAPL"), ("STOCK", "NVDA"), ("CRYPTO", "BTCUSDT")] # Örnek
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
+            for m, s in assets: exe.submit(scan_asset, m, s)
+        
+        time.sleep(LOOP_INTERVAL_SEC)
 
 if __name__ == "__main__":
-    telegram_gonder(ID_KANAL, "🔗 BİNANCE ENTEGRASYONU TAMAMLANDI!\nKriptolar anlık, hisseler Yahoo üzerinden taranıyor.")
-    
-    Thread(target=tarama_motoru, args=("Günlük", "1d", "2y", (20, 140), 1800, ID_GUNLUK)).start()
-    Thread(target=tarama_motoru, args=("4 Saat", "4h", "100d", (50, 200), 900, ID_KANAL)).start()
-    Thread(target=tarama_motoru, args=("1 Saat", "1h", "30d", (50, 200), 600, ID_KANAL)).start()
-    Thread(target=tarama_motoru, args=("15 Dakika", "15m", "7d", (20, 50), 300, ID_KANAL)).start()
-    
-    server = HTTPServer(('0.0.0.0', 10000), HealthHandler)
-    server.serve_forever()
+    run()
